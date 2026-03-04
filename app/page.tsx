@@ -107,14 +107,10 @@ export default function Home() {
                 {/* Replace this with your real photo */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="YOUR_PHOTO_URL_HERE"
-                  alt="Where Legacy & Recipe began"
-                  className="h-[360px] w-full object-cover"
-                  onError={(e) => {
-                    // if you haven't added a photo yet, show a placeholder gradient
-                    (e.currentTarget as HTMLImageElement).style.display = "none";
-                  }}
-                />
+  src={recipe.photo_url || "/placeholder.jpg"}
+  alt={recipe.title}
+  className="..."
+/>
                 <div className="h-[360px] w-full bg-gradient-to-br from-white/10 to-white/5 flex items-center justify-center">
                   <div className="text-sm text-white/70">
                     Add your photo here (wedding day / cookbook moment)
