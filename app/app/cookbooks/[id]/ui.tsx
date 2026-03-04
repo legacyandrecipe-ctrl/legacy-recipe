@@ -50,6 +50,18 @@ function catIndex(cat?: string | null) {
   return i === -1 ? 999 : i;
 }
 
+/**
+ * Supabase joins can sometimes come back as:
+ * - object (expected)
+ * - array (depending on relationship typing)
+ * - null
+ */
+function normalizeRecipe(r: any): AnyRecipe | null {
+  if (!r) return null;
+  if (Array.isArray(r)) return (r[0] as AnyRecipe) ?? null;
+  return r as AnyRecipe;
+}
+
 export default function CookbookBuilder({
   cookbookId,
   allRecipes,
@@ -68,9 +80,10 @@ export default function CookbookBuilder({
         id: r.id,
         recipe_id: r.recipe_id,
         sort_order: r.sort_order ?? 0,
-        recipes: r.recipes,
+        recipes: normalizeRecipe(r.recipes),
       }))
       .filter((r: any) => r.recipes && r.recipes.id)
+      .map((r: any) => ({ ...r, recipes: r.recipes as AnyRecipe }))
       .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
   }, [cookbookRecipes]);
 
@@ -98,13 +111,10 @@ export default function CookbookBuilder({
     setTimeout(() => setMsg(null), 1500);
   }
 
-  // Fetch pending recipes connected to this cookbook (if your schema supports recipes.status)
+  // Fetch pending recipes connected to this cookbook (only if your schema supports recipes.status)
   async function loadPending() {
     setPendingLoading(true);
     try {
-      // This requires:
-      // - recipes.status column
-      // - cookbook_recipes join to recipes
       const { data, error } = await supabase
         .from("cookbook_recipes")
         .select(
@@ -113,15 +123,15 @@ export default function CookbookBuilder({
         .eq("cookbook_id", cookbookId);
 
       if (error) {
-        // If columns don't exist yet, don't break the page
         setPending([]);
         return;
       }
 
       const pendingRecipes: AnyRecipe[] =
         (data ?? [])
-          .map((row: any) => row.recipes)
-          .filter((r: any) => r && r.id && String(r.status || "").toLowerCase() === "pending") ?? [];
+          .map((row: any) => normalizeRecipe(row.recipes))
+          .filter((r: any) => r && r.id && String(r.status || "").toLowerCase() === "pending")
+          .map((r: any) => r as AnyRecipe) ?? [];
 
       setPending(pendingRecipes);
     } finally {
@@ -130,7 +140,6 @@ export default function CookbookBuilder({
   }
 
   useEffect(() => {
-    // load pending on first render + whenever cookbook changes
     loadPending();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cookbookId]);
@@ -139,7 +148,6 @@ export default function CookbookBuilder({
     if (!selectedRecipeId) return;
 
     setSaving(true);
-
     try {
       const nextOrder = items.length ? Math.max(...items.map((x) => x.sort_order ?? 0)) + 1 : 0;
 
@@ -153,13 +161,22 @@ export default function CookbookBuilder({
         .select("id,sort_order,recipe_id, recipes(id,title,category,source_name,source_side,photo_url)")
         .single();
 
-      if (error) return setMsg(error.message);
+      if (error) {
+        setMsg(error.message);
+        return;
+      }
+
+      const recipeObj = normalizeRecipe(data?.recipes);
+      if (!recipeObj) {
+        setMsg("Recipe added, but details failed to load. Refresh the page.");
+        return;
+      }
 
       const row: CookbookRecipeRow = {
         id: data.id,
         recipe_id: data.recipe_id,
         sort_order: data.sort_order ?? nextOrder,
-        recipes: data.recipes,
+        recipes: recipeObj,
       };
 
       setItems((prev) => [...prev, row]);
@@ -172,11 +189,12 @@ export default function CookbookBuilder({
 
   async function removeRow(rowId: string) {
     setSaving(true);
-
     try {
       const { error } = await supabase.from("cookbook_recipes").delete().eq("id", rowId);
-      if (error) return setMsg(error.message);
-
+      if (error) {
+        setMsg(error.message);
+        return;
+      }
       setItems((prev) => prev.filter((x) => x.id !== rowId));
       flash("Removed");
     } finally {
@@ -195,7 +213,6 @@ export default function CookbookBuilder({
     const updates = newItems.map((row, idx) =>
       supabase.from("cookbook_recipes").update({ sort_order: idx }).eq("id", row.id)
     );
-
     await Promise.all(updates);
   }
 
@@ -218,13 +235,11 @@ export default function CookbookBuilder({
 
   async function autoSort() {
     setSaving(true);
-
     try {
       const newItems = [...items]
         .sort((a, b) => {
           const ca = catIndex(a.recipes.category);
           const cb = catIndex(b.recipes.category);
-
           if (ca !== cb) return ca - cb;
           return a.recipes.title.localeCompare(b.recipes.title);
         })
@@ -232,32 +247,12 @@ export default function CookbookBuilder({
 
       setItems(newItems);
       await persistOrder(newItems);
-
       flash("Sorted by category!");
     } finally {
       setSaving(false);
     }
   }
 
-  // Category dividers are purely visual (no “sections” feature)
-  const itemsWithDividers = useMemo(() => {
-    const out: Array<{ type: "divider"; label: string } | { type: "row"; row: CookbookRecipeRow }> =
-      [];
-    let lastCat = "";
-
-    // This uses current order (drag order or auto-sort order)
-    for (const row of items) {
-      const c = normalizeCategory(row.recipes.category);
-      if (c !== lastCat) {
-        out.push({ type: "divider", label: c });
-        lastCat = c;
-      }
-      out.push({ type: "row", row });
-    }
-    return out;
-  }, [items]);
-
-  // Approve/Reject endpoints (you said we created these earlier)
   async function approveRecipe(recipeId: string) {
     setSaving(true);
     try {
@@ -267,8 +262,10 @@ export default function CookbookBuilder({
         body: JSON.stringify({ recipe_id: recipeId }),
       });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok) return setMsg(json?.error ?? "Could not approve.");
-
+      if (!res.ok) {
+        setMsg(json?.error ?? "Could not approve.");
+        return;
+      }
       flash("Approved!");
       await loadPending();
     } finally {
@@ -285,8 +282,10 @@ export default function CookbookBuilder({
         body: JSON.stringify({ recipe_id: recipeId }),
       });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok) return setMsg(json?.error ?? "Could not reject.");
-
+      if (!res.ok) {
+        setMsg(json?.error ?? "Could not reject.");
+        return;
+      }
       flash("Rejected.");
       await loadPending();
     } finally {
@@ -296,7 +295,7 @@ export default function CookbookBuilder({
 
   return (
     <div className="grid gap-6">
-      {/* Pending recipes (invite submissions) */}
+      {/* Pending recipes */}
       <div className="rounded-2xl border p-5 grid gap-3">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -305,6 +304,7 @@ export default function CookbookBuilder({
               Approve or reject recipes submitted via your invite link.
             </div>
           </div>
+
           <button
             onClick={loadPending}
             className="rounded-xl border px-4 py-2 text-sm font-medium hover:bg-slate-50"
@@ -328,10 +328,15 @@ export default function CookbookBuilder({
                   <div className="flex items-center gap-3">
                     {r.photo_url ? (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={r.photo_url} alt="" className="h-14 w-14 rounded-xl object-cover border" />
+                      <img
+                        src={r.photo_url}
+                        alt=""
+                        className="h-14 w-14 rounded-xl object-cover border"
+                      />
                     ) : (
                       <div className="h-14 w-14 rounded-xl border bg-slate-50" />
                     )}
+
                     <div>
                       <div className="font-medium">{r.title}</div>
                       <div className="text-xs text-slate-500">
@@ -416,79 +421,79 @@ export default function CookbookBuilder({
         </div>
 
         {items.length === 0 ? (
-          <div className="rounded-xl border bg-slate-50 p-6 text-sm text-slate-600">No recipes added yet.</div>
+          <div className="rounded-xl border bg-slate-50 p-6 text-sm text-slate-600">
+            No recipes added yet.
+          </div>
         ) : (
           <DragDropContext onDragEnd={onDragEnd}>
             <Droppable droppableId="cookbook-recipes">
               {(provided) => (
                 <div ref={provided.innerRef} {...provided.droppableProps} className="grid gap-3">
-                  {itemsWithDividers.map((item, idx) => {
-                    if (item.type === "divider") {
-                      return (
-                        <div
-                          key={`divider-${item.label}-${idx}`}
-                          className="mt-2 mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500"
-                        >
-                          {item.label}
-                        </div>
-                      );
-                    }
+                  {items.map((it, idx) => {
+                    const currentCat = normalizeCategory(it.recipes.category);
+                    const prevCat =
+                      idx === 0 ? null : normalizeCategory(items[idx - 1]?.recipes?.category);
 
-                    const it = item.row;
-
-                    // Need to map divider-aware index to draggable index (only rows count)
-                    const draggableIndex = items.findIndex((x) => x.id === it.id);
+                    const showDivider = idx === 0 || currentCat !== prevCat;
 
                     return (
-                      <Draggable key={it.id} draggableId={it.id} index={draggableIndex}>
-                        {(drag) => (
-                          <div
-                            ref={drag.innerRef}
-                            {...drag.draggableProps}
-                            className="rounded-2xl border p-4 bg-white"
-                          >
-                            <div className="flex items-center justify-between gap-3">
-                              <div className="flex items-center gap-3">
-                                <div
-                                  {...drag.dragHandleProps}
-                                  className="cursor-grab rounded-lg border bg-slate-50 px-2 py-2 text-xs text-slate-600"
-                                  title="Drag"
-                                >
-                                  ⇅
-                                </div>
-
-                                {it.recipes.photo_url ? (
-                                  // eslint-disable-next-line @next/next/no-img-element
-                                  <img
-                                    src={it.recipes.photo_url}
-                                    alt=""
-                                    className="h-14 w-14 rounded-xl object-cover border"
-                                  />
-                                ) : (
-                                  <div className="h-14 w-14 rounded-xl border bg-slate-50" />
-                                )}
-
-                                <div>
-                                  <div className="font-medium">{it.recipes.title}</div>
-                                  {it.recipes.category && (
-                                    <span className="inline-block mt-1 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700">
-                                      {it.recipes.category}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-
-                              <button
-                                onClick={() => removeRow(it.id)}
-                                className="rounded-xl border px-3 py-2 text-xs hover:bg-slate-50"
-                                disabled={saving}
-                              >
-                                Remove
-                              </button>
-                            </div>
+                      <div key={it.id} className="grid gap-2">
+                        {showDivider ? (
+                          <div className="mt-2 mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            {currentCat}
                           </div>
-                        )}
-                      </Draggable>
+                        ) : null}
+
+                        <Draggable draggableId={it.id} index={idx}>
+                          {(drag) => (
+                            <div
+                              ref={drag.innerRef}
+                              {...drag.draggableProps}
+                              className="rounded-2xl border p-4 bg-white"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-3">
+                                  <div
+                                    {...drag.dragHandleProps}
+                                    className="cursor-grab rounded-lg border bg-slate-50 px-2 py-2 text-xs text-slate-600"
+                                    title="Drag"
+                                  >
+                                    ⇅
+                                  </div>
+
+                                  {it.recipes.photo_url ? (
+                                    // eslint-disable-next-line @next/next/no-img-element
+                                    <img
+                                      src={it.recipes.photo_url}
+                                      alt=""
+                                      className="h-14 w-14 rounded-xl object-cover border"
+                                    />
+                                  ) : (
+                                    <div className="h-14 w-14 rounded-xl border bg-slate-50" />
+                                  )}
+
+                                  <div>
+                                    <div className="font-medium">{it.recipes.title}</div>
+                                    {it.recipes.category ? (
+                                      <span className="inline-block mt-1 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700">
+                                        {it.recipes.category}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                </div>
+
+                                <button
+                                  onClick={() => removeRow(it.id)}
+                                  className="rounded-xl border px-3 py-2 text-xs hover:bg-slate-50"
+                                  disabled={saving}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </Draggable>
+                      </div>
                     );
                   })}
 
